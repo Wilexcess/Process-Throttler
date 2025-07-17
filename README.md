@@ -2,7 +2,7 @@
 
 Process Throttler is a simple but powerful lag switch for Windows games and applications. It gives you fine-tuned control over your connection by letting you selectively block internet traffic for a specific program using hotkeys and other activation methods.
 
-![Screenshot of the application](https://i.imgur.com/uvdLqyJ.png)  
+![Screenshot of the application](https://i.imgur.com/TxBW8G4.png)  
 
 ## Features
 
@@ -17,6 +17,7 @@ Process Throttler is a simple but powerful lag switch for Windows games and appl
     *   The first click starts a timer; after your chosen delay (in ms), the packet drop activates.
     *   A second click instantly deactivates it..
 *   **Dynamic Port Discovery:** Automatically finds the network ports used by the target application and updates them periodically.
+*   **Config Saving:** Automatically save options you have entered to an INI file.
 
 ## How to Use
 
