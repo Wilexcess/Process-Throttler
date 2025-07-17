@@ -27,7 +27,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "shell32.lib") // Required for ShellExecuteEx
+#pragma comment(lib, "shell32.lib")
 
 // --- Global Variables ---
 DWORD g_targetPid = 0;
@@ -46,7 +46,8 @@ HWND g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth;
 HWND g_hToggleKeyEdit, g_hTimedKeyEdit, g_hTimedModeMsEdit;
 HWND g_hInboundCheck, g_hOutboundCheck, g_hBothCheck;
 HWND g_hStartButton, g_hStopButton;
-HWND g_hTimedModeStatusLabel, g_hStatusLabel;
+HWND g_hTimedModeStatusLabel, g_hStatusLabel, g_hTimedModeExplanationLabel;
+HWND g_hEnableTimedModeCheck, g_hAlwaysOnTopCheck;
 std::vector<HWND> g_configControls;
 
 // --- Application Settings ---
@@ -70,9 +71,10 @@ void start_throttling();
 void stop_throttling();
 void delayed_toggle_on_thread();
 void set_config_controls_state(bool enabled);
+void set_timed_mode_controls_state(bool enabled);
 void SaveSettings();
 void LoadSettings();
-BOOL IsRunningAsAdmin(); // NEW
+BOOL IsRunningAsAdmin();
 
 DWORD find_pid_by_name(const std::wstring& processName) {
     PROCESSENTRY32 processInfo; processInfo.dwSize = sizeof(processInfo);
@@ -83,37 +85,50 @@ DWORD find_pid_by_name(const std::wstring& processName) {
     while (Process32Next(hSnapshot, &processInfo)) { if (processName.compare(processInfo.szExeFile) == 0) { CloseHandle(hSnapshot); return processInfo.th32ProcessID; } }
     CloseHandle(hSnapshot); return 0;
 }
+
 bool discover_ports_for_pid(DWORD pid) {
-    g_robloxPorts.clear(); PMIB_TCPTABLE_OWNER_PID tcpTable; PMIB_UDPTABLE_OWNER_PID udpTable; DWORD size = 0; size_t tcpPortsFound = 0, udpPortsFound = 0;
+    g_robloxPorts.clear(); PMIB_TCPTABLE_OWNER_PID tcpTable = NULL; PMIB_UDPTABLE_OWNER_PID udpTable = NULL;
+    DWORD size = 0; size_t tcpPortsFound = 0, udpPortsFound = 0;
+    // Suppress warning C28020: this is a known false positive with the GetExtendedTcpTable two-call pattern.
+#pragma warning(suppress: 28020)
     if (GetExtendedTcpTable(NULL, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER) {
         tcpTable = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
-        if (GetExtendedTcpTable(tcpTable, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-            for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) { if (tcpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)tcpTable->table[i].dwLocalPort)); tcpPortsFound++; } }
-        } free(tcpTable);
-    } size = 0;
+        if (tcpTable != NULL) { // FIX: Check if malloc succeeded
+            if (GetExtendedTcpTable(tcpTable, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
+                for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) { if (tcpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)tcpTable->table[i].dwLocalPort)); tcpPortsFound++; } }
+            } free(tcpTable);
+        }
+    }
+    size = 0;
     if (GetExtendedUdpTable(NULL, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == ERROR_INSUFFICIENT_BUFFER) {
         udpTable = (PMIB_UDPTABLE_OWNER_PID)malloc(size);
-        if (GetExtendedUdpTable(udpTable, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-            for (DWORD i = 0; i < udpTable->dwNumEntries; i++) { if (udpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)udpTable->table[i].dwLocalPort)); udpPortsFound++; } }
-        } free(udpTable);
+        if (udpTable != NULL) { // FIX: Check if malloc succeeded
+            if (GetExtendedUdpTable(udpTable, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
+                for (DWORD i = 0; i < udpTable->dwNumEntries; i++) { if (udpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)udpTable->table[i].dwLocalPort)); udpPortsFound++; } }
+            } free(udpTable);
+        }
     }
     if (g_robloxPorts.empty()) { return false; }
     update_status(L"Discovered " + std::to_wstring(tcpPortsFound) + L" TCP and " + std::to_wstring(udpPortsFound) + L" UDP ports. Ready."); return true;
 }
+
 void packet_worker_thread() {
-    char packet[65535]; UINT packetLen; WINDIVERT_ADDRESS addr; PWINDIVERT_IPHDR ip_header; PWINDIVERT_TCPHDR tcp_header; PWINDIVERT_UDPHDR udp_header;
+    // FIX: Allocate packet buffer on the heap using std::vector to avoid stack overflow warnings.
+    std::vector<char> packet(65535);
+    UINT packetLen; WINDIVERT_ADDRESS addr; PWINDIVERT_IPHDR ip_header; PWINDIVERT_TCPHDR tcp_header; PWINDIVERT_UDPHDR udp_header;
     while (!g_exitSignal) {
-        if (!WinDivertRecv(g_winDivertHandle, packet, sizeof(packet), &packetLen, &addr)) { continue; }
-        WinDivertHelperParsePacket(packet, packetLen, &ip_header, NULL, NULL, NULL, NULL, &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
+        if (!WinDivertRecv(g_winDivertHandle, packet.data(), (UINT)packet.size(), &packetLen, &addr)) { continue; }
+        WinDivertHelperParsePacket(packet.data(), packetLen, &ip_header, NULL, NULL, NULL, NULL, &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
         bool is_roblox_packet = false;
         if (tcp_header) { if (g_robloxPorts.count(ntohs(tcp_header->SrcPort)) || g_robloxPorts.count(ntohs(tcp_header->DstPort))) is_roblox_packet = true; }
         else if (udp_header) { if (g_robloxPorts.count(ntohs(udp_header->SrcPort)) || g_robloxPorts.count(ntohs(udp_header->DstPort))) is_roblox_packet = true; }
-        if (!is_roblox_packet) { WinDivertSend(g_winDivertHandle, packet, packetLen, NULL, &addr); continue; }
+        if (!is_roblox_packet) { WinDivertSend(g_winDivertHandle, packet.data(), packetLen, NULL, &addr); continue; }
         bool is_inbound = !addr.Outbound;
         if (g_isThrottlingActive.load()) { bool should_drop = (is_inbound && g_throttleInbound) || (!is_inbound && g_throttleOutbound); if (should_drop) { continue; } }
-        WinDivertSend(g_winDivertHandle, packet, packetLen, NULL, &addr);
+        WinDivertSend(g_winDivertHandle, packet.data(), packetLen, NULL, &addr);
     }
 }
+
 void delayed_toggle_on_thread() {
     g_isDelayActive = true; update_status(L"Waiting " + std::to_wstring(g_timedModeMs) + L"ms...", true);
     std::this_thread::sleep_for(std::chrono::milliseconds(g_timedModeMs));
@@ -128,7 +143,7 @@ void input_handler_thread() {
             toggle_key_down = true;
         }
         else { toggle_key_down = false; }
-        if (GetAsyncKeyState(g_timedModeToggleKey.load()) & 0x8000) {
+        if (IsDlgButtonChecked(g_hwnd, 401) && (GetAsyncKeyState(g_timedModeToggleKey.load()) & 0x8000)) {
             if (!timed_key_down) {
                 g_isTimedModeEnabled = !g_isTimedModeEnabled;
                 if (!g_isTimedModeEnabled.load() && g_isThrottlingActive.load()) { g_isThrottlingActive = false; update_status(L"Packet drop DISABLED"); }
@@ -161,67 +176,38 @@ void port_discovery_loop() {
     while (!g_exitSignal) { if (g_targetPid != 0) discover_ports_for_pid(g_targetPid); std::this_thread::sleep_for(std::chrono::seconds(5)); }
 }
 
-// Checks if the current process is running with administrative privileges.
-BOOL IsRunningAsAdmin()
-{
-    BOOL fIsAdmin = FALSE;
-    HANDLE hToken = NULL;
+BOOL IsRunningAsAdmin() {
+    BOOL fIsAdmin = FALSE; HANDLE hToken = NULL;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
-        TOKEN_ELEVATION Elevation;
-        DWORD cbSize = sizeof(TOKEN_ELEVATION);
-        if (GetTokenInformation(hToken, TokenElevation, &Elevation, sizeof(Elevation), &cbSize)) {
-            fIsAdmin = Elevation.TokenIsElevated;
-        }
-    }
-    if (hToken) {
-        CloseHandle(hToken);
-    }
-    return fIsAdmin;
+        TOKEN_ELEVATION Elevation; DWORD cbSize = sizeof(TOKEN_ELEVATION);
+        if (GetTokenInformation(hToken, TokenElevation, &Elevation, sizeof(Elevation), &cbSize)) { fIsAdmin = Elevation.TokenIsElevated; }
+    } if (hToken) { CloseHandle(hToken); } return fIsAdmin;
 }
 
-// Main entry point for the application.
-int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
-    // --- NEW: UAC Elevation Check ---
-    // If the program is not running as admin, ask the user to relaunch.
+// FIX: Use the full, annotated signature for wWinMain to resolve C28251.
+int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE hPrevInstance, _In_ LPWSTR lpCmdLine, _In_ int nShowCmd) {
     if (!IsRunningAsAdmin()) {
         wchar_t szPath[MAX_PATH];
         if (GetModuleFileName(NULL, szPath, ARRAYSIZE(szPath))) {
-            // Relaunch the application with administrative rights.
             SHELLEXECUTEINFO sei = { sizeof(sei) };
-            sei.lpVerb = L"runas"; // This triggers the UAC prompt
-            sei.lpFile = szPath;
-            sei.hwnd = NULL;
-            sei.nShow = SW_NORMAL;
-            if (ShellExecuteEx(&sei)) {
-                // The new elevated process was started successfully, so we can exit this one.
-                return 0;
-            }
-            else {
-                // If the user clicks "No" on the UAC prompt, or it fails.
-                MessageBox(NULL, L"This application requires administrator privileges to function correctly.", L"Elevation Failed", MB_OK | MB_ICONERROR);
-                return 1; // Exit with an error code.
-            }
-        }
-        return 1; // Exit if we can't even get our own file path.
+            sei.lpVerb = L"runas"; sei.lpFile = szPath; sei.hwnd = NULL; sei.nShow = SW_NORMAL;
+            if (ShellExecuteEx(&sei)) { return 0; }
+            else { MessageBox(NULL, L"This application requires administrator privileges.", L"Elevation Failed", MB_OK | MB_ICONERROR); return 1; }
+        } return 1;
     }
-    // --- End of UAC Check ---
 
-    // Get path for config.ini in the same directory as the executable.
     GetModuleFileName(NULL, g_iniPath, MAX_PATH);
     wchar_t* lastSlash = wcsrchr(g_iniPath, L'\\');
-    if (lastSlash) {
-        *(lastSlash + 1) = L'\0';
-        wcscat_s(g_iniPath, MAX_PATH, L"config.ini");
-    }
+    if (lastSlash) { *(lastSlash + 1) = L'\0'; wcscat_s(g_iniPath, MAX_PATH, L"config.ini"); }
 
     const wchar_t CLASS_NAME[] = L"ProcessThrottlerWindowClass"; WNDCLASS wc = { };
     wc.lpfnWndProc = WindowProc; wc.hInstance = hInstance; wc.lpszClassName = CLASS_NAME; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClass(&wc);
-    g_hwnd = CreateWindowEx(0, CLASS_NAME, L"Process Throttler", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 480, 510, NULL, NULL, hInstance, NULL);
+    g_hwnd = CreateWindowEx(0, CLASS_NAME, L"Process Throttler", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 480, 580, NULL, NULL, hInstance, NULL);
     if (g_hwnd == NULL) return 0;
     create_gui_elements(g_hwnd);
     LoadSettings();
-    ShowWindow(g_hwnd, nCmdShow);
+    ShowWindow(g_hwnd, nShowCmd);
     MSG msg = { }; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
     stop_throttling(); return 0;
 }
@@ -229,15 +215,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int nCmdShow) {
 LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_KEYDOWN: {
-        UINT vkCode = (UINT)wParam;
-        wchar_t keyName[50];
-        LONG scanCode = (lParam >> 16) & 0xFF;
+        UINT vkCode = (UINT)wParam; wchar_t keyName[50]; LONG scanCode = (lParam >> 16) & 0xFF;
         if (vkCode == VK_SHIFT || vkCode == VK_CONTROL || vkCode == VK_MENU) { scanCode |= 0x100; }
         GetKeyNameText(scanCode << 16, keyName, sizeof(keyName) / sizeof(wchar_t));
         if (hwnd == g_hToggleKeyEdit) { g_toggleKey = vkCode; }
         else if (hwnd == g_hTimedKeyEdit) { g_timedModeToggleKey = vkCode; }
-        SetWindowText(hwnd, keyName);
-        return 0;
+        SetWindowText(hwnd, keyName); return 0;
     }
     case WM_CHAR: case WM_KEYUP: return 0;
     }
@@ -245,13 +228,9 @@ LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
     return CallWindowProc(g_originalTimedKeyProc, hwnd, uMsg, wParam, lParam);
 }
 
-// Main window message handler.
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-    case WM_DESTROY:
-        SaveSettings(); // Save settings when the app is closed.
-        PostQuitMessage(0);
-        return 0;
+    case WM_DESTROY: SaveSettings(); PostQuitMessage(0); return 0;
     case WM_COMMAND: {
         if (HIWORD(wParam) == BN_CLICKED) {
             HWND hButtonClicked = (HWND)lParam;
@@ -259,6 +238,13 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             else if (hButtonClicked == g_hStopButton) {
                 update_status(L"Stopping..."); stop_throttling(); g_exitSignal = false;
                 update_status(L"Stopped. Ready to start."); set_config_controls_state(true);
+            }
+            else if (hButtonClicked == g_hEnableTimedModeCheck) {
+                set_timed_mode_controls_state(IsDlgButtonChecked(hwnd, 401));
+            }
+            else if (hButtonClicked == g_hAlwaysOnTopCheck) {
+                RECT rect; GetWindowRect(hwnd, &rect);
+                SetWindowPos(hwnd, IsDlgButtonChecked(hwnd, 402) ? HWND_TOPMOST : HWND_NOTOPMOST, rect.left, rect.top, 0, 0, SWP_NOSIZE | SWP_NOMOVE);
             }
             else if (hButtonClicked == g_hInboundCheck || hButtonClicked == g_hOutboundCheck) {
                 g_throttleInbound = IsDlgButtonChecked(hwnd, 201); g_throttleOutbound = IsDlgButtonChecked(hwnd, 202);
@@ -277,82 +263,84 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 }
 
 void create_gui_elements(HWND hwnd) {
+    const int Y_PADDING = 28; // Consistent vertical spacing for controls
+    const int Y_GROUP_PADDING = 35; // Larger spacing between logical groups
     int current_y = 10;
-    HWND hProcLabel = CreateWindow(L"STATIC", L"Process Name:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
+
+    CreateWindow(L"STATIC", L"Process Name:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
     g_hProcessNameEdit = CreateWindow(L"EDIT", L"RobloxPlayerBeta.exe", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, current_y, 295, 20, hwnd, NULL, NULL, NULL);
-    current_y += 30;
+    current_y += Y_PADDING;
     g_hProtoTCP = CreateWindow(L"BUTTON", L"TCP", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 10, current_y, 50, 20, hwnd, (HMENU)301, NULL, NULL);
     g_hProtoUDP = CreateWindow(L"BUTTON", L"UDP", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 70, current_y, 50, 20, hwnd, (HMENU)302, NULL, NULL);
     g_hProtoBoth = CreateWindow(L"BUTTON", L"Both", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 130, current_y, 60, 20, hwnd, (HMENU)303, NULL, NULL);
-    HWND hProtoRecommendLabel = CreateWindow(L"STATIC", L"<- If you're unsure, use Both.", WS_VISIBLE | WS_CHILD, 200, current_y, 255, 20, hwnd, NULL, NULL, NULL);
-    current_y += 30;
-    HWND hToggleKeyLabel = CreateWindow(L"STATIC", L"Toggle Keybind:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
+    CreateWindow(L"STATIC", L"<- If you're unsure, use Both.", WS_VISIBLE | WS_CHILD, 200, current_y, 255, 20, hwnd, NULL, NULL, NULL);
+    current_y += Y_GROUP_PADDING;
+    CreateWindow(L"STATIC", L"Toggle Keybind:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
     g_hToggleKeyEdit = CreateWindow(L"EDIT", L"B", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, current_y, 100, 20, hwnd, (HMENU)101, NULL, NULL);
-    current_y += 30;
-    HWND hTimedKeyLabel = CreateWindow(L"STATIC", L"Timed Mode Hotkey:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
+    current_y += Y_GROUP_PADDING;
+    g_hEnableTimedModeCheck = CreateWindow(L"BUTTON", L"Enable Timed Mode", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, current_y, 145, 20, hwnd, (HMENU)401, NULL, NULL);
+    current_y += Y_PADDING;
+    CreateWindow(L"STATIC", L"Timed Mode Hotkey:", WS_VISIBLE | WS_CHILD, 25, current_y, 130, 20, hwnd, NULL, NULL, NULL);
     g_hTimedKeyEdit = CreateWindow(L"EDIT", L"X", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, current_y, 100, 20, hwnd, (HMENU)102, NULL, NULL);
     g_hTimedModeStatusLabel = CreateWindow(L"STATIC", L"Timed Mode: OFF", WS_VISIBLE | WS_CHILD, 270, current_y, 185, 20, hwnd, NULL, NULL, NULL);
     g_originalToggleKeyProc = (WNDPROC)SetWindowLongPtr(g_hToggleKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
     g_originalTimedKeyProc = (WNDPROC)SetWindowLongPtr(g_hTimedKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
-    current_y += 30;
-    HWND hTimedModeMsLabel = CreateWindow(L"STATIC", L"Enter ms:", WS_VISIBLE | WS_CHILD, 10, current_y, 145, 20, hwnd, NULL, NULL, NULL);
+    current_y += Y_PADDING;
+    CreateWindow(L"STATIC", L"Enter ms:", WS_VISIBLE | WS_CHILD, 25, current_y, 130, 20, hwnd, NULL, NULL, NULL);
     g_hTimedModeMsEdit = CreateWindow(L"EDIT", L"160", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, current_y, 50, 20, hwnd, (HMENU)103, NULL, NULL);
-    current_y += 30;
-    HWND hTimedModeExplanationLabel = CreateWindow(L"STATIC", L"When Timed Mode is ON, the first click starts a delayed lagswitch.\nA second click will instantly disable it. (Used for gearless offset)", WS_VISIBLE | WS_CHILD, 10, current_y, 445, 40, hwnd, NULL, NULL, NULL);
-    current_y += 50;
+    current_y += Y_PADDING;
+    g_hTimedModeExplanationLabel = CreateWindow(L"STATIC", L"When Timed Mode is ON, first click starts delay, second click disables.", WS_VISIBLE | WS_CHILD, 25, current_y, 430, 20, hwnd, NULL, NULL, NULL);
+    current_y += Y_GROUP_PADDING;
     g_hInboundCheck = CreateWindow(L"BUTTON", L"Inbound (Used for COM Offset)", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, current_y, 240, 20, hwnd, (HMENU)201, NULL, NULL);
-    current_y += 30;
+    current_y += Y_PADDING;
     g_hOutboundCheck = CreateWindow(L"BUTTON", L"Outbound", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, current_y, 120, 20, hwnd, (HMENU)202, NULL, NULL);
-    current_y += 30;
+    current_y += Y_PADDING;
     g_hBothCheck = CreateWindow(L"BUTTON", L"Both", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, current_y, 120, 20, hwnd, (HMENU)203, NULL, NULL);
-    current_y += 60;
+    current_y += Y_PADDING;
+    g_hAlwaysOnTopCheck = CreateWindow(L"BUTTON", L"Always on Top", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, current_y, 120, 20, hwnd, (HMENU)402, NULL, NULL);
+    current_y += Y_GROUP_PADDING;
     g_hStatusLabel = CreateWindow(L"STATIC", L"Status: Idle. Press Start.", WS_VISIBLE | WS_CHILD, 10, current_y, 445, 40, hwnd, NULL, NULL, NULL);
     current_y += 50;
     g_hStartButton = CreateWindow(L"BUTTON", L"Start", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 130, current_y, 100, 30, hwnd, (HMENU)1, NULL, NULL);
     g_hStopButton = CreateWindow(L"BUTTON", L"Stop", WS_VISIBLE | WS_CHILD, 250, current_y, 100, 30, hwnd, (HMENU)2, NULL, NULL);
     EnableWindow(g_hStopButton, FALSE);
-    g_configControls = { g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth, g_hToggleKeyEdit, g_hTimedKeyEdit, g_hTimedModeMsEdit, g_hInboundCheck, g_hOutboundCheck, g_hBothCheck };
+    g_configControls = { g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth, g_hEnableTimedModeCheck, g_hToggleKeyEdit, g_hInboundCheck, g_hOutboundCheck, g_hBothCheck, g_hAlwaysOnTopCheck };
 }
 
 void SaveSettings() {
     wchar_t buffer[256];
-    GetWindowText(g_hProcessNameEdit, buffer, 256);
-    WritePrivateProfileString(L"Settings", L"ProcessName", buffer, g_iniPath);
+    GetWindowText(g_hProcessNameEdit, buffer, 256); WritePrivateProfileString(L"Settings", L"ProcessName", buffer, g_iniPath);
     int protocol = IsDlgButtonChecked(g_hwnd, 301) ? 0 : (IsDlgButtonChecked(g_hwnd, 302) ? 1 : 2);
-    wsprintf(buffer, L"%d", protocol);
-    WritePrivateProfileString(L"Settings", L"Protocol", buffer, g_iniPath);
-    wsprintf(buffer, L"%u", g_toggleKey.load());
-    WritePrivateProfileString(L"Settings", L"ToggleKey", buffer, g_iniPath);
-    wsprintf(buffer, L"%u", g_timedModeToggleKey.load());
-    WritePrivateProfileString(L"Settings", L"TimedKey", buffer, g_iniPath);
-    GetWindowText(g_hTimedModeMsEdit, buffer, 256);
-    WritePrivateProfileString(L"Settings", L"TimedMs", buffer, g_iniPath);
-    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 201) ? 1 : 0);
-    WritePrivateProfileString(L"Settings", L"BlockInbound", buffer, g_iniPath);
-    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 202) ? 1 : 0);
-    WritePrivateProfileString(L"Settings", L"BlockOutbound", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", protocol); WritePrivateProfileString(L"Settings", L"Protocol", buffer, g_iniPath);
+    wsprintf(buffer, L"%u", g_toggleKey.load()); WritePrivateProfileString(L"Settings", L"ToggleKey", buffer, g_iniPath);
+    wsprintf(buffer, L"%u", g_timedModeToggleKey.load()); WritePrivateProfileString(L"Settings", L"TimedKey", buffer, g_iniPath);
+    GetWindowText(g_hTimedModeMsEdit, buffer, 256); WritePrivateProfileString(L"Settings", L"TimedMs", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 201) ? 1 : 0); WritePrivateProfileString(L"Settings", L"BlockInbound", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 202) ? 1 : 0); WritePrivateProfileString(L"Settings", L"BlockOutbound", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 401) ? 1 : 0); WritePrivateProfileString(L"Settings", L"EnableTimedMode", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 402) ? 1 : 0); WritePrivateProfileString(L"Settings", L"AlwaysOnTop", buffer, g_iniPath);
 }
-
 void LoadSettings() {
     wchar_t buffer[256]; wchar_t keyName[50];
-    GetPrivateProfileString(L"Settings", L"ProcessName", L"RobloxPlayerBeta.exe", buffer, 256, g_iniPath);
-    SetWindowText(g_hProcessNameEdit, buffer);
+    GetPrivateProfileString(L"Settings", L"ProcessName", L"RobloxPlayerBeta.exe", buffer, 256, g_iniPath); SetWindowText(g_hProcessNameEdit, buffer);
     int protocol = GetPrivateProfileInt(L"Settings", L"Protocol", 2, g_iniPath);
     if (protocol == 0) CheckDlgButton(g_hwnd, 301, BST_CHECKED); else if (protocol == 1) CheckDlgButton(g_hwnd, 302, BST_CHECKED); else CheckDlgButton(g_hwnd, 303, BST_CHECKED);
     UINT vkCode = GetPrivateProfileInt(L"Settings", L"ToggleKey", 'B', g_iniPath); g_toggleKey = vkCode;
-    GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t));
-    SetWindowText(g_hToggleKeyEdit, keyName);
+    GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t)); SetWindowText(g_hToggleKeyEdit, keyName);
     vkCode = GetPrivateProfileInt(L"Settings", L"TimedKey", 'X', g_iniPath); g_timedModeToggleKey = vkCode;
-    GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t));
-    SetWindowText(g_hTimedKeyEdit, keyName);
-    int timedMs = GetPrivateProfileInt(L"Settings", L"TimedMs", 160, g_iniPath); wsprintf(buffer, L"%d", timedMs);
-    SetWindowText(g_hTimedModeMsEdit, buffer);
+    GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t)); SetWindowText(g_hTimedKeyEdit, keyName);
+    int timedMs = GetPrivateProfileInt(L"Settings", L"TimedMs", 160, g_iniPath); wsprintf(buffer, L"%d", timedMs); SetWindowText(g_hTimedModeMsEdit, buffer);
     bool blockInbound = GetPrivateProfileInt(L"Settings", L"BlockInbound", 1, g_iniPath) == 1;
     bool blockOutbound = GetPrivateProfileInt(L"Settings", L"BlockOutbound", 0, g_iniPath) == 1;
     CheckDlgButton(g_hwnd, 201, blockInbound ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_hwnd, 202, blockOutbound ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_hwnd, 203, (blockInbound && blockOutbound) ? BST_CHECKED : BST_UNCHECKED);
     g_throttleInbound = blockInbound; g_throttleOutbound = blockOutbound;
+    bool enableTimed = GetPrivateProfileInt(L"Settings", L"EnableTimedMode", 0, g_iniPath) == 1;
+    CheckDlgButton(g_hwnd, 401, enableTimed ? BST_CHECKED : BST_UNCHECKED); set_timed_mode_controls_state(enableTimed);
+    bool alwaysOnTop = GetPrivateProfileInt(L"Settings", L"AlwaysOnTop", 0, g_iniPath) == 1;
+    CheckDlgButton(g_hwnd, 402, alwaysOnTop ? BST_CHECKED : BST_UNCHECKED);
+    if (alwaysOnTop) { RECT rect; GetWindowRect(g_hwnd, &rect); SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE); }
 }
 
 void update_status(const std::wstring& status, bool isSubStatus) {
@@ -361,7 +349,16 @@ void update_status(const std::wstring& status, bool isSubStatus) {
 }
 void set_config_controls_state(bool enabled) {
     for (HWND hControl : g_configControls) { EnableWindow(hControl, enabled); }
+    if (enabled) { set_timed_mode_controls_state(IsDlgButtonChecked(g_hwnd, 401)); }
+    else { set_timed_mode_controls_state(false); }
     EnableWindow(g_hStartButton, enabled); EnableWindow(g_hStopButton, !enabled);
+}
+void set_timed_mode_controls_state(bool enabled) {
+    EnableWindow(g_hTimedKeyEdit, enabled);
+    EnableWindow(g_hTimedModeMsEdit, enabled);
+    EnableWindow(g_hTimedModeExplanationLabel, enabled);
+    EnableWindow(g_hTimedModeStatusLabel, enabled);
+    if (!enabled) { g_isTimedModeEnabled = false; update_status(L"Timed Mode: OFF", true); }
 }
 void start_throttling() {
     wchar_t buffer[256]; GetWindowText(g_hProcessNameEdit, buffer, 256); std::wstring processName = buffer;
