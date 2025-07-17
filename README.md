@@ -51,10 +51,54 @@ If the problem persists even after placing the files correctly, you may have a "
 
 ## Building from Source
 
-If you want to build the project yourself:
-*   **Environment:** Visual Studio (2019/2022 recommended) with the C++ Desktop Development workload.
-*   **SDK:** Download the WinDivert SDK and place `windivert.h`, `windivert.lib`, and `windivert.dll` in your project directory.
-*   **Linker:** Ensure you are linking against `ws2_32.lib`, `iphlpapi.lib`, and `WinDivert.lib`.
+## 🛠️ If You Want to Build the Project Yourself
+
+To compile and run the project manually, follow these steps:
+
+### ✅ Environment
+- Use **Visual Studio 2019** or **2022** (Community Edition is fine).
+- Make sure the **"Desktop Development with C++"** workload is installed.  
+  You can add it via the Visual Studio Installer if needed.
+
+### 📦 WinDivert SDK
+1. Download the latest WinDivert SDK from:  
+   https://reqrypt.org/windivert.html
+
+2. From the extracted SDK, copy the following files into your project folder:
+   - `include/windivert.h` → put it in an `include/` folder inside your project.
+   - `x64/WinDivert.lib` or `x86/WinDivert.lib` → put it in a `lib/` folder.
+   - `x64/WinDivert.dll` or `x86/WinDivert.dll` → place next to your `.exe` after build (i.e., in `Debug/` or `Release/`).
+
+3. Make sure the architecture of the `.lib` and `.dll` (x64 or x86) matches your project’s target platform.
+
+### ⚙️ Visual Studio Configuration
+
+#### VC++ Directories:
+- **Include Directories**:  
+  ```
+  $(ProjectDir)include
+  ```
+- **Library Directories**:  
+  ```
+  $(ProjectDir)lib
+  ```
+
+#### Linker → Input → Additional Dependencies:
+Add the following libraries:
+```
+WinDivert.lib
+ws2_32.lib
+iphlpapi.lib
+```
+
+These are required for packet interception and network API support.
+
+### 🧪 Final Notes:
+- Run Visual Studio as **Administrator**, or opening a WinDivert handle will fail with error code 5.
+- Ensure the `WinDivert.dll` is next to your compiled `.exe` at runtime.
+- Always match the **platform target** (x64/x86) with the version of `WinDivert.lib` and `WinDivert.dll` you’re using.
+
+
 
 ## Disclaimer
 
