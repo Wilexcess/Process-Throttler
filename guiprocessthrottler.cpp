@@ -16,7 +16,8 @@
 #include <iphlpapi.h>
 #include <io.h>
 #include <fcntl.h>
-#include <shellapi.h> // Required for ShellExecuteEx
+#include <shellapi.h>
+#include <wininet.h>
 
 // Include the WinDivert header
 #include "windivert.h"
@@ -28,6 +29,14 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "wininet.lib")
+
+// --- Application Info ---
+const std::wstring APP_VERSION = L"v1.2.1"; // This is now the current version
+const std::wstring GITHUB_REPO = L"Wilexcess/Process-Throttler";
+
+// Custom message to signal that background shutdown is complete
+#define WM_APP_STOP_COMPLETE (WM_APP + 1)
 
 // --- Global Variables ---
 DWORD g_targetPid = 0;
@@ -51,9 +60,9 @@ HWND g_hEnableTimedModeCheck, g_hAlwaysOnTopCheck;
 std::vector<HWND> g_configControls;
 
 // --- Application Settings ---
-std::atomic<UINT> g_toggleKey = 'B';
-std::atomic<UINT> g_timedModeToggleKey = 'X';
-int g_timedModeMs = 160;
+std::atomic<UINT> g_toggleKey = 'Z';
+std::atomic<UINT> g_timedModeToggleKey = 'C';
+int g_timedModeMs = 200;
 bool g_throttleInbound = true, g_throttleOutbound = false;
 
 // --- Hooks and Subclassing ---
@@ -68,13 +77,14 @@ LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 void create_gui_elements(HWND hwnd);
 void update_status(const std::wstring& status, bool isSubStatus = false);
 void start_throttling();
-void stop_throttling();
+void stop_throttling_worker();
 void delayed_toggle_on_thread();
-void set_config_controls_state(bool enabled);
+void set_config_controls_state(bool enabled, bool stopping = false);
 void set_timed_mode_controls_state(bool enabled);
 void SaveSettings();
 void LoadSettings();
 BOOL IsRunningAsAdmin();
+void CheckForUpdates();
 
 
 DWORD find_pid_by_name(const std::wstring& processName) {
@@ -86,35 +96,22 @@ DWORD find_pid_by_name(const std::wstring& processName) {
     while (Process32Next(hSnapshot, &processInfo)) { if (processName.compare(processInfo.szExeFile) == 0) { CloseHandle(hSnapshot); return processInfo.th32ProcessID; } }
     CloseHandle(hSnapshot); return 0;
 }
-
 bool discover_ports_for_pid(DWORD pid) {
     g_robloxPorts.clear(); PMIB_TCPTABLE_OWNER_PID tcpTable = NULL; PMIB_UDPTABLE_OWNER_PID udpTable = NULL;
     DWORD size = 0; size_t tcpPortsFound = 0, udpPortsFound = 0;
-#pragma warning(suppress: 28020)
     if (GetExtendedTcpTable(NULL, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == ERROR_INSUFFICIENT_BUFFER) {
         tcpTable = (PMIB_TCPTABLE_OWNER_PID)malloc(size);
-        if (tcpTable != NULL) {
-            if (GetExtendedTcpTable(tcpTable, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) {
-                for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) { if (tcpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)tcpTable->table[i].dwLocalPort)); tcpPortsFound++; } }
-            } free(tcpTable);
-        }
-    }
-    size = 0;
+        if (tcpTable) { if (GetExtendedTcpTable(tcpTable, &size, TRUE, AF_INET, TCP_TABLE_OWNER_PID_ALL, 0) == NO_ERROR) { for (DWORD i = 0; i < tcpTable->dwNumEntries; i++) { if (tcpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)tcpTable->table[i].dwLocalPort)); tcpPortsFound++; } } } free(tcpTable); }
+    } size = 0;
     if (GetExtendedUdpTable(NULL, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == ERROR_INSUFFICIENT_BUFFER) {
         udpTable = (PMIB_UDPTABLE_OWNER_PID)malloc(size);
-        if (udpTable != NULL) {
-            if (GetExtendedUdpTable(udpTable, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) {
-                for (DWORD i = 0; i < udpTable->dwNumEntries; i++) { if (udpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)udpTable->table[i].dwLocalPort)); udpPortsFound++; } }
-            } free(udpTable);
-        }
+        if (udpTable) { if (GetExtendedUdpTable(udpTable, &size, TRUE, AF_INET, UDP_TABLE_OWNER_PID, 0) == NO_ERROR) { for (DWORD i = 0; i < udpTable->dwNumEntries; i++) { if (udpTable->table[i].dwOwningPid == pid) { g_robloxPorts.insert(ntohs((u_short)udpTable->table[i].dwLocalPort)); udpPortsFound++; } } } free(udpTable); }
     }
     if (g_robloxPorts.empty()) { return false; }
     update_status(L"Discovered " + std::to_wstring(tcpPortsFound) + L" TCP and " + std::to_wstring(udpPortsFound) + L" UDP ports. Ready."); return true;
 }
-
 void packet_worker_thread() {
-    std::vector<char> packet(65535);
-    UINT packetLen; WINDIVERT_ADDRESS addr; PWINDIVERT_IPHDR ip_header; PWINDIVERT_TCPHDR tcp_header; PWINDIVERT_UDPHDR udp_header;
+    std::vector<char> packet(65535); UINT packetLen; WINDIVERT_ADDRESS addr; PWINDIVERT_IPHDR ip_header; PWINDIVERT_TCPHDR tcp_header; PWINDIVERT_UDPHDR udp_header;
     while (!g_exitSignal) {
         if (!WinDivertRecv(g_winDivertHandle, packet.data(), (UINT)packet.size(), &packetLen, &addr)) { continue; }
         WinDivertHelperParsePacket(packet.data(), packetLen, &ip_header, NULL, NULL, NULL, NULL, &tcp_header, &udp_header, NULL, NULL, NULL, NULL);
@@ -127,26 +124,32 @@ void packet_worker_thread() {
         WinDivertSend(g_winDivertHandle, packet.data(), packetLen, NULL, &addr);
     }
 }
-
 void delayed_toggle_on_thread() {
     g_isDelayActive = true; update_status(L"Waiting " + std::to_wstring(g_timedModeMs) + L"ms...", true);
     std::this_thread::sleep_for(std::chrono::milliseconds(g_timedModeMs));
     if (g_isDelayActive.load() && !g_exitSignal.load()) { g_isThrottlingActive = true; update_status(L"Packet drop ENABLED"); }
     g_isDelayActive = false;
 }
-
 void input_handler_thread() {
-    bool toggle_key_down = false;
+    bool toggle_key_down = false, timed_key_down = false;
     while (!g_exitSignal) {
         if (GetAsyncKeyState(g_toggleKey.load()) & 0x8000) {
             if (!toggle_key_down) { g_isThrottlingActive = !g_isThrottlingActive; update_status(g_isThrottlingActive ? L"Packet drop ENABLED" : L"Packet drop DISABLED"); }
             toggle_key_down = true;
-        }
-        else { toggle_key_down = false; }
+        } else { toggle_key_down = false; }
+        if (IsDlgButtonChecked(g_hwnd, 401)) {
+            if (GetAsyncKeyState(g_timedModeToggleKey.load()) & 0x8000) {
+                if (!timed_key_down) {
+                    g_isTimedModeEnabled = !g_isTimedModeEnabled;
+                    if (!g_isTimedModeEnabled.load() && g_isThrottlingActive.load()) { g_isThrottlingActive = false; update_status(L"Packet drop DISABLED"); }
+                    update_status(g_isTimedModeEnabled ? L"Timed Mode: ON (Click to use)" : L"Timed Mode: OFF", true);
+                }
+                timed_key_down = true;
+            } else { timed_key_down = false; }
+        } else { timed_key_down = false; }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
-
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_LBUTTONDOWN) {
         if (g_isTimedModeEnabled.load()) {
@@ -159,17 +162,14 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         }
     } return CallNextHookEx(g_mouseHook, nCode, wParam, lParam);
 }
-
 void mouse_hook_thread() {
     g_mouseHook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandle(NULL), 0);
     MSG msg; while (GetMessage(&msg, NULL, 0, 0) > 0) { TranslateMessage(&msg); DispatchMessage(&msg); }
     UnhookWindowsHookEx(g_mouseHook);
 }
-
 void port_discovery_loop() {
     while (!g_exitSignal) { if (g_targetPid != 0) discover_ports_for_pid(g_targetPid); std::this_thread::sleep_for(std::chrono::seconds(5)); }
 }
-
 BOOL IsRunningAsAdmin() {
     BOOL fIsAdmin = FALSE; HANDLE hToken = NULL;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
@@ -177,7 +177,35 @@ BOOL IsRunningAsAdmin() {
         if (GetTokenInformation(hToken, TokenElevation, &Elevation, sizeof(Elevation), &cbSize)) { fIsAdmin = Elevation.TokenIsElevated; }
     } if (hToken) { CloseHandle(hToken); } return fIsAdmin;
 }
-
+void CheckForUpdates() {
+    HINTERNET hInternet = InternetOpen(L"ProcessThrottlerUpdateChecker", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0);
+    if (hInternet) {
+        std::wstring url = L"https://api.github.com/repos/" + GITHUB_REPO + L"/releases/latest";
+        HINTERNET hConnect = InternetOpenUrl(hInternet, url.c_str(), NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_SECURE, 0);
+        if (hConnect) {
+            char buffer[4096]; DWORD bytesRead = 0; std::string response;
+            while (InternetReadFile(hConnect, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead > 0) { buffer[bytesRead] = '\0'; response += buffer; }
+            InternetCloseHandle(hConnect);
+            std::string tagNameKey = "\"tag_name\":\"";
+            size_t start = response.find(tagNameKey);
+            if (start != std::string::npos) {
+                start += tagNameKey.length(); size_t end = response.find("\"", start);
+                if (end != std::string::npos) {
+                    std::string latestVersionStr = response.substr(start, end - start);
+                    std::wstring latestVersion(latestVersionStr.begin(), latestVersionStr.end());
+                    if (APP_VERSION.compare(latestVersion) != 0) {
+                        std::wstring message = L"A new version is available!\n\nYour version: " + APP_VERSION + L"\nLatest version: " + latestVersion + L"\n\nGo to download page?";
+                        if (MessageBox(NULL, message.c_str(), L"Update Available", MB_YESNO | MB_ICONINFORMATION) == IDYES) {
+                            std::wstring downloadUrl = L"https://github.com/" + GITHUB_REPO + L"/releases/latest";
+                            ShellExecute(NULL, L"open", downloadUrl.c_str(), NULL, NULL, SW_SHOWNORMAL);
+                        }
+                    }
+                }
+            }
+        }
+        InternetCloseHandle(hInternet);
+    }
+}
 int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _In_ int nShowCmd) {
     if (!IsRunningAsAdmin()) {
         wchar_t szPath[MAX_PATH];
@@ -188,31 +216,28 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
             else { MessageBox(NULL, L"This application requires administrator privileges.", L"Elevation Failed", MB_OK | MB_ICONERROR); return 1; }
         } return 1;
     }
-
     GetModuleFileName(NULL, g_iniPath, MAX_PATH);
     wchar_t* lastSlash = wcsrchr(g_iniPath, L'\\');
     if (lastSlash) { *(lastSlash + 1) = L'\0'; wcscat_s(g_iniPath, MAX_PATH, L"config.ini"); }
-
+    std::thread(CheckForUpdates).detach();
     const wchar_t CLASS_NAME[] = L"ProcessThrottlerWindowClass"; WNDCLASS wc = { };
     wc.lpfnWndProc = WindowProc; wc.hInstance = hInstance; wc.lpszClassName = CLASS_NAME; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClass(&wc);
-    g_hwnd = CreateWindowEx(0, CLASS_NAME, L"Process Throttler", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 480, 520, NULL, NULL, hInstance, NULL);
+    std::wstring windowTitle = L"Process Throttler " + APP_VERSION;
+    g_hwnd = CreateWindowEx(0, CLASS_NAME, windowTitle.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 480, 520, NULL, NULL, hInstance, NULL);
     if (g_hwnd == NULL) return 0;
-    create_gui_elements(g_hwnd);
-    LoadSettings();
+    create_gui_elements(g_hwnd); LoadSettings();
     ShowWindow(g_hwnd, nShowCmd);
     MSG msg = { }; while (GetMessage(&msg, NULL, 0, 0)) { TranslateMessage(&msg); DispatchMessage(&msg); }
-    stop_throttling(); return 0;
+    return 0;
 }
-
 LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_KEYDOWN: {
         UINT vkCode = (UINT)wParam; wchar_t keyName[50]; LONG scanCode = (lParam >> 16) & 0xFF;
         if (vkCode == VK_SHIFT || vkCode == VK_CONTROL || vkCode == VK_MENU) { scanCode |= 0x100; }
         GetKeyNameText(scanCode << 16, keyName, sizeof(keyName) / sizeof(wchar_t));
-        if (hwnd == g_hToggleKeyEdit) { g_toggleKey = vkCode; }
-        else if (hwnd == g_hTimedKeyEdit) { g_timedModeToggleKey = vkCode; }
+        if (hwnd == g_hToggleKeyEdit) { g_toggleKey = vkCode; } else if (hwnd == g_hTimedKeyEdit) { g_timedModeToggleKey = vkCode; }
         SetWindowText(hwnd, keyName); return 0;
     }
     case WM_CHAR: case WM_KEYUP: return 0;
@@ -220,24 +245,30 @@ LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
     if (hwnd == g_hToggleKeyEdit) { return CallWindowProc(g_originalToggleKeyProc, hwnd, uMsg, wParam, lParam); }
     return CallWindowProc(g_originalTimedKeyProc, hwnd, uMsg, wParam, lParam);
 }
-
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
-    case WM_DESTROY: SaveSettings(); PostQuitMessage(0); return 0;
+    case WM_DESTROY: SaveSettings(); stop_throttling_worker(); PostQuitMessage(0); return 0;
+    // *** NEW *** Handle the message sent by the shutdown thread
+    case WM_APP_STOP_COMPLETE:
+        update_status(L"Stopped. Ready to start.");
+        set_config_controls_state(true, false);
+        return 0;
     case WM_COMMAND: {
         if (HIWORD(wParam) == BN_CLICKED) {
             HWND hButtonClicked = (HWND)lParam;
             if (hButtonClicked == g_hStartButton) { start_throttling(); }
             else if (hButtonClicked == g_hStopButton) {
-                update_status(L"Stopping..."); stop_throttling(); g_exitSignal = false;
-                update_status(L"Stopped. Ready to start."); set_config_controls_state(true);
+                // --- NEW SHUTDOWN LOGIC ---
+                // 1. Instantly turn off throttling for safety.
+                g_isThrottlingActive = false;
+                // 2. Update status and lock UI to prevent more clicks.
+                update_status(L"Stopping...");
+                set_config_controls_state(false, true); // `true` indicates we're in the stopping phase.
+                // 3. Launch a background thread to do the slow work.
+                std::thread(stop_throttling_worker).detach();
             }
-            else if (hButtonClicked == g_hEnableTimedModeCheck) {
-                set_timed_mode_controls_state(IsDlgButtonChecked(hwnd, 401));
-            }
-            else if (hButtonClicked == g_hAlwaysOnTopCheck) {
-                SetWindowPos(hwnd, IsDlgButtonChecked(hwnd, 402) ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
-            }
+            else if (hButtonClicked == g_hEnableTimedModeCheck) { set_timed_mode_controls_state(IsDlgButtonChecked(hwnd, 401)); }
+            else if (hButtonClicked == g_hAlwaysOnTopCheck) { SetWindowPos(hwnd, IsDlgButtonChecked(hwnd, 402) ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE); }
             else if (hButtonClicked == g_hInboundCheck || hButtonClicked == g_hOutboundCheck) {
                 g_throttleInbound = IsDlgButtonChecked(hwnd, 201); g_throttleOutbound = IsDlgButtonChecked(hwnd, 202);
                 CheckDlgButton(hwnd, 203, (g_throttleInbound && g_throttleOutbound) ? BST_CHECKED : BST_UNCHECKED);
@@ -253,11 +284,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
-
 void create_gui_elements(HWND hwnd) {
     int y = 10;
     const int ITEM_HEIGHT = 20; const int LABEL_WIDTH = 145; const int EDIT_WIDTH = 100;
-    const int ROW_GAP = 28; const int GROUP_GAP = 38;
+    const int ROW_GAP = 28; const int GROUP_GAP = 35;
 
     CreateWindow(L"STATIC", L"Process Name:", WS_VISIBLE | WS_CHILD, 10, y, LABEL_WIDTH, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
     g_hProcessNameEdit = CreateWindow(L"EDIT", L"RobloxPlayerBeta.exe", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, y, 295, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
@@ -269,20 +299,21 @@ void create_gui_elements(HWND hwnd) {
     y += GROUP_GAP;
 
     CreateWindow(L"STATIC", L"Toggle Keybind:", WS_VISIBLE | WS_CHILD, 10, y, LABEL_WIDTH, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hToggleKeyEdit = CreateWindow(L"EDIT", L"B", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)101, NULL, NULL);
+    g_hToggleKeyEdit = CreateWindow(L"EDIT", L"Z", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)101, NULL, NULL);
     y += GROUP_GAP;
 
     g_hEnableTimedModeCheck = CreateWindow(L"BUTTON", L"Enable Timed Mode", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 145, ITEM_HEIGHT, hwnd, (HMENU)401, NULL, NULL);
     y += ROW_GAP;
     CreateWindow(L"STATIC", L"Timed Mode Hotkey:", WS_VISIBLE | WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hTimedKeyEdit = CreateWindow(L"EDIT", L"X", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)102, NULL, NULL);
+    g_hTimedKeyEdit = CreateWindow(L"EDIT", L"C", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)102, NULL, NULL);
     g_hTimedModeStatusLabel = CreateWindow(L"STATIC", L"Timed Mode: OFF", WS_VISIBLE | WS_CHILD, 270, y, 185, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
     y += ROW_GAP;
     CreateWindow(L"STATIC", L"Enter ms:", WS_VISIBLE | WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hTimedModeMsEdit = CreateWindow(L"EDIT", L"160", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, y, 50, ITEM_HEIGHT, hwnd, (HMENU)103, NULL, NULL);
+    g_hTimedModeMsEdit = CreateWindow(L"EDIT", L"200", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, y, 50, ITEM_HEIGHT, hwnd, (HMENU)103, NULL, NULL);
     y += ROW_GAP;
     g_hTimedModeExplanationLabel = CreateWindow(L"STATIC", L"When Timed Mode is ON, and you press the hotkey, first click starts delay, then turns on the switch, second click disables.", WS_VISIBLE | WS_CHILD, 25, y, 430, 50, hwnd, NULL, NULL, NULL);
-    y += GROUP_GAP;
+    y += 50;
+    y += 15;
 
     g_hInboundCheck = CreateWindow(L"BUTTON", L"Inbound (Used for COM Offset)", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 240, ITEM_HEIGHT, hwnd, (HMENU)201, NULL, NULL);
     y += ROW_GAP;
@@ -303,7 +334,6 @@ void create_gui_elements(HWND hwnd) {
     g_originalToggleKeyProc = (WNDPROC)SetWindowLongPtr(g_hToggleKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
     g_originalTimedKeyProc = (WNDPROC)SetWindowLongPtr(g_hTimedKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
 }
-
 void SaveSettings() {
     wchar_t buffer[256];
     GetWindowText(g_hProcessNameEdit, buffer, 256); WritePrivateProfileString(L"Settings", L"ProcessName", buffer, g_iniPath);
@@ -322,33 +352,34 @@ void LoadSettings() {
     GetPrivateProfileString(L"Settings", L"ProcessName", L"RobloxPlayerBeta.exe", buffer, 256, g_iniPath); SetWindowText(g_hProcessNameEdit, buffer);
     int protocol = GetPrivateProfileInt(L"Settings", L"Protocol", 2, g_iniPath);
     if (protocol == 0) CheckDlgButton(g_hwnd, 301, BST_CHECKED); else if (protocol == 1) CheckDlgButton(g_hwnd, 302, BST_CHECKED); else CheckDlgButton(g_hwnd, 303, BST_CHECKED);
-    UINT vkCode = GetPrivateProfileInt(L"Settings", L"ToggleKey", 'B', g_iniPath); g_toggleKey = vkCode;
+    UINT vkCode = GetPrivateProfileInt(L"Settings", L"ToggleKey", 'Z', g_iniPath); g_toggleKey = vkCode;
     GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t)); SetWindowText(g_hToggleKeyEdit, keyName);
-    vkCode = GetPrivateProfileInt(L"Settings", L"TimedKey", 'X', g_iniPath); g_timedModeToggleKey = vkCode;
+    vkCode = GetPrivateProfileInt(L"Settings", L"TimedKey", 'C', g_iniPath); g_timedModeToggleKey = vkCode;
     GetKeyNameText(MapVirtualKey(vkCode, MAPVK_VK_TO_VSC) << 16, keyName, sizeof(keyName) / sizeof(wchar_t)); SetWindowText(g_hTimedKeyEdit, keyName);
-    int timedMs = GetPrivateProfileInt(L"Settings", L"TimedMs", 160, g_iniPath); wsprintf(buffer, L"%d", timedMs); SetWindowText(g_hTimedModeMsEdit, buffer);
+    int timedMs = GetPrivateProfileInt(L"Settings", L"TimedMs", 200, g_iniPath); wsprintf(buffer, L"%d", timedMs); SetWindowText(g_hTimedModeMsEdit, buffer);
     bool blockInbound = GetPrivateProfileInt(L"Settings", L"BlockInbound", 1, g_iniPath) == 1;
     bool blockOutbound = GetPrivateProfileInt(L"Settings", L"BlockOutbound", 0, g_iniPath) == 1;
     CheckDlgButton(g_hwnd, 201, blockInbound ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_hwnd, 202, blockOutbound ? BST_CHECKED : BST_UNCHECKED);
     CheckDlgButton(g_hwnd, 203, (blockInbound && blockOutbound) ? BST_CHECKED : BST_UNCHECKED);
     g_throttleInbound = blockInbound; g_throttleOutbound = blockOutbound;
-    bool enableTimed = GetPrivateProfileInt(L"Settings", L"EnableTimedMode", 0, g_iniPath) == 1;
+    bool enableTimed = GetPrivateProfileInt(L"Settings", L"EnableTimedMode", 1, g_iniPath) == 1;
     CheckDlgButton(g_hwnd, 401, enableTimed ? BST_CHECKED : BST_UNCHECKED); set_timed_mode_controls_state(enableTimed);
-    bool alwaysOnTop = GetPrivateProfileInt(L"Settings", L"AlwaysOnTop", 0, g_iniPath) == 1;
+    bool alwaysOnTop = GetPrivateProfileInt(L"Settings", L"AlwaysOnTop", 1, g_iniPath) == 1;
     CheckDlgButton(g_hwnd, 402, alwaysOnTop ? BST_CHECKED : BST_UNCHECKED);
     if (alwaysOnTop) { SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE); }
 }
-
 void update_status(const std::wstring& status, bool isSubStatus) {
-    if (isSubStatus) { SetWindowText(g_hTimedModeStatusLabel, status.c_str()); }
+    if (isSubStatus) { SetWindowText(g_hTimedModeStatusLabel, status.c_str()); } 
     else { SetWindowText(g_hStatusLabel, (L"Status: " + status).c_str()); }
 }
-void set_config_controls_state(bool enabled) {
+void set_config_controls_state(bool enabled, bool stopping) {
     for (HWND hControl : g_configControls) { EnableWindow(hControl, enabled); }
     if (enabled) { set_timed_mode_controls_state(IsDlgButtonChecked(g_hwnd, 401)); }
     else { set_timed_mode_controls_state(false); }
-    EnableWindow(g_hStartButton, enabled); EnableWindow(g_hStopButton, !enabled);
+    EnableWindow(g_hStartButton, enabled);
+    EnableWindow(g_hStopButton, !enabled);
+    if (stopping) { EnableWindow(g_hStopButton, FALSE); }
 }
 void set_timed_mode_controls_state(bool enabled) {
     EnableWindow(g_hTimedKeyEdit, enabled);
@@ -366,14 +397,18 @@ void start_throttling() {
     const char* filter = IsDlgButtonChecked(g_hwnd, 301) ? "tcp" : (IsDlgButtonChecked(g_hwnd, 302) ? "udp" : "tcp or udp");
     g_winDivertHandle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
     if (g_winDivertHandle == INVALID_HANDLE_VALUE) { update_status(GetLastError() == 5 ? L"Error: Must be run as Administrator." : L"Error: WinDivert failed. Code: " + std::to_wstring(GetLastError())); return; }
+    g_exitSignal = false; // Reset signal before starting threads
     set_config_controls_state(false);
     g_workerThread = std::thread(packet_worker_thread); g_inputThread = std::thread(input_handler_thread);
     g_portDiscoveryThread = std::thread(port_discovery_loop); g_mouseHookThread = std::thread(mouse_hook_thread);
 }
-void stop_throttling() {
+// *** FIX: This is now the dedicated background shutdown function ***
+void stop_throttling_worker() {
     g_exitSignal = true;
     if (g_mouseHook) { PostThreadMessageW(GetThreadId(g_mouseHookThread.native_handle()), WM_QUIT, 0, 0); g_mouseHook = NULL; }
     if (g_winDivertHandle) { WinDivertClose(g_winDivertHandle); g_winDivertHandle = NULL; }
     if (g_workerThread.joinable()) g_workerThread.join(); if (g_inputThread.joinable()) g_inputThread.join();
     if (g_portDiscoveryThread.joinable()) g_portDiscoveryThread.join(); if (g_mouseHookThread.joinable()) g_mouseHookThread.join();
+    // After everything is joined, send a message back to the UI thread to re-enable controls
+    PostMessage(g_hwnd, WM_APP_STOP_COMPLETE, 0, 0);
 }
