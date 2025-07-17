@@ -95,7 +95,7 @@ These are required for packet interception and network API support.
 
 ### 🧪 Final Notes:
 - Run Visual Studio as **Administrator**, or opening a WinDivert handle will fail with error code 5.
-- Ensure the `WinDivert.dll` is next to your compiled `.exe` at runtime.
+- Ensure the `WinDivert.dll` and `WinDivert64.sys` are next to your compiled `.exe` at runtime.
 - Always match the **platform target** (x64/x86) with the version of `WinDivert.lib` and `WinDivert.dll` you’re using.
 
 
