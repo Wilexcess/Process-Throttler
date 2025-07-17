@@ -32,7 +32,7 @@
 #pragma comment(lib, "wininet.lib")
 
 // --- Application Info ---
-const std::wstring APP_VERSION = L"v1.3.6";
+const std::wstring APP_VERSION = L"v1.3.7";
 const std::wstring GITHUB_REPO = L"Wilexcess/Process-Throttler";
 
 // Custom message to signal that background shutdown is complete
