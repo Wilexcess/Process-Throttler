@@ -12,6 +12,7 @@
 #include <atomic>
 
 #include <windows.h>
+#include <commctrl.h> // Required for Tab Controls
 #include <tlhelp32.h>
 #include <iphlpapi.h>
 #include <io.h>
@@ -32,7 +33,7 @@
 #pragma comment(lib, "wininet.lib")
 
 // --- Application Info ---
-const std::wstring APP_VERSION = L"v1.2.1"; // This is now the current version
+const std::wstring APP_VERSION = L"v1.3.0";
 const std::wstring GITHUB_REPO = L"Wilexcess/Process-Throttler";
 
 // Custom message to signal that background shutdown is complete
@@ -50,14 +51,15 @@ std::thread g_workerThread, g_inputThread, g_portDiscoveryThread, g_mouseHookThr
 wchar_t g_iniPath[MAX_PATH];
 
 // --- GUI Handles ---
-HWND g_hwnd;
+HWND g_hwnd, g_hTabControl;
 HWND g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth;
 HWND g_hToggleKeyEdit, g_hTimedKeyEdit, g_hTimedModeMsEdit;
 HWND g_hInboundCheck, g_hOutboundCheck, g_hBothCheck;
 HWND g_hStartButton, g_hStopButton;
 HWND g_hTimedModeStatusLabel, g_hStatusLabel, g_hTimedModeExplanationLabel;
-HWND g_hEnableTimedModeCheck, g_hAlwaysOnTopCheck;
-std::vector<HWND> g_configControls;
+HWND g_hEnableTimedModeCheck, g_hAlwaysOnTopCheck, g_hEnableToggleKeyCheck; // NEW
+HWND g_hInstructionsText;
+std::vector<HWND> g_settingsControls, g_instructionsControls, g_configControls;
 
 // --- Application Settings ---
 std::atomic<UINT> g_toggleKey = 'Z';
@@ -67,8 +69,7 @@ bool g_throttleInbound = true, g_throttleOutbound = false;
 
 // --- Hooks and Subclassing ---
 HHOOK g_mouseHook = NULL;
-WNDPROC g_originalToggleKeyProc;
-WNDPROC g_originalTimedKeyProc;
+WNDPROC g_originalToggleKeyProc, g_originalTimedKeyProc;
 
 // --- Function Declarations ---
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -85,7 +86,7 @@ void SaveSettings();
 void LoadSettings();
 BOOL IsRunningAsAdmin();
 void CheckForUpdates();
-
+void SwitchTab(int tabIndex);
 
 DWORD find_pid_by_name(const std::wstring& processName) {
     PROCESSENTRY32 processInfo; processInfo.dwSize = sizeof(processInfo);
@@ -133,10 +134,14 @@ void delayed_toggle_on_thread() {
 void input_handler_thread() {
     bool toggle_key_down = false, timed_key_down = false;
     while (!g_exitSignal) {
-        if (GetAsyncKeyState(g_toggleKey.load()) & 0x8000) {
-            if (!toggle_key_down) { g_isThrottlingActive = !g_isThrottlingActive; update_status(g_isThrottlingActive ? L"Packet drop ENABLED" : L"Packet drop DISABLED"); }
-            toggle_key_down = true;
-        } else { toggle_key_down = false; }
+        if (IsDlgButtonChecked(g_hwnd, 403)) { // Check if instant toggle is enabled
+            if (GetAsyncKeyState(g_toggleKey.load()) & 0x8000) {
+                if (!toggle_key_down) { g_isThrottlingActive = !g_isThrottlingActive; update_status(g_isThrottlingActive ? L"Packet drop ENABLED" : L"Packet drop DISABLED"); }
+                toggle_key_down = true;
+            }
+            else { toggle_key_down = false; }
+        }
+        else { toggle_key_down = false; }
         if (IsDlgButtonChecked(g_hwnd, 401)) {
             if (GetAsyncKeyState(g_timedModeToggleKey.load()) & 0x8000) {
                 if (!timed_key_down) {
@@ -145,8 +150,10 @@ void input_handler_thread() {
                     update_status(g_isTimedModeEnabled ? L"Timed Mode: ON (Click to use)" : L"Timed Mode: OFF", true);
                 }
                 timed_key_down = true;
-            } else { timed_key_down = false; }
-        } else { timed_key_down = false; }
+            }
+            else { timed_key_down = false; }
+        }
+        else { timed_key_down = false; }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
@@ -224,7 +231,7 @@ int WINAPI wWinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPWSTR, _
     wc.lpfnWndProc = WindowProc; wc.hInstance = hInstance; wc.lpszClassName = CLASS_NAME; wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     RegisterClass(&wc);
     std::wstring windowTitle = L"Process Throttler " + APP_VERSION;
-    g_hwnd = CreateWindowEx(0, CLASS_NAME, windowTitle.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 480, 520, NULL, NULL, hInstance, NULL);
+    g_hwnd = CreateWindowEx(0, CLASS_NAME, windowTitle.c_str(), WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, 500, 580, NULL, NULL, hInstance, NULL);
     if (g_hwnd == NULL) return 0;
     create_gui_elements(g_hwnd); LoadSettings();
     ShowWindow(g_hwnd, nShowCmd);
@@ -237,7 +244,8 @@ LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
         UINT vkCode = (UINT)wParam; wchar_t keyName[50]; LONG scanCode = (lParam >> 16) & 0xFF;
         if (vkCode == VK_SHIFT || vkCode == VK_CONTROL || vkCode == VK_MENU) { scanCode |= 0x100; }
         GetKeyNameText(scanCode << 16, keyName, sizeof(keyName) / sizeof(wchar_t));
-        if (hwnd == g_hToggleKeyEdit) { g_toggleKey = vkCode; } else if (hwnd == g_hTimedKeyEdit) { g_timedModeToggleKey = vkCode; }
+        if (hwnd == g_hToggleKeyEdit) { g_toggleKey = vkCode; }
+        else if (hwnd == g_hTimedKeyEdit) { g_timedModeToggleKey = vkCode; }
         SetWindowText(hwnd, keyName); return 0;
     }
     case WM_CHAR: case WM_KEYUP: return 0;
@@ -248,23 +256,23 @@ LRESULT CALLBACK KeybindEditProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lPa
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     switch (uMsg) {
     case WM_DESTROY: SaveSettings(); stop_throttling_worker(); PostQuitMessage(0); return 0;
-    // *** NEW *** Handle the message sent by the shutdown thread
     case WM_APP_STOP_COMPLETE:
         update_status(L"Stopped. Ready to start.");
         set_config_controls_state(true, false);
         return 0;
+    case WM_NOTIFY: // Handle tab switching
+        if (((LPNMHDR)lParam)->code == TCN_SELCHANGE) {
+            int selectedTab = TabCtrl_GetCurSel(g_hTabControl);
+            SwitchTab(selectedTab);
+        }
+        break;
     case WM_COMMAND: {
         if (HIWORD(wParam) == BN_CLICKED) {
             HWND hButtonClicked = (HWND)lParam;
             if (hButtonClicked == g_hStartButton) { start_throttling(); }
             else if (hButtonClicked == g_hStopButton) {
-                // --- NEW SHUTDOWN LOGIC ---
-                // 1. Instantly turn off throttling for safety.
-                g_isThrottlingActive = false;
-                // 2. Update status and lock UI to prevent more clicks.
-                update_status(L"Stopping...");
-                set_config_controls_state(false, true); // `true` indicates we're in the stopping phase.
-                // 3. Launch a background thread to do the slow work.
+                g_isThrottlingActive = false; update_status(L"Stopping...");
+                set_config_controls_state(false, true);
                 std::thread(stop_throttling_worker).detach();
             }
             else if (hButtonClicked == g_hEnableTimedModeCheck) { set_timed_mode_controls_state(IsDlgButtonChecked(hwnd, 401)); }
@@ -285,54 +293,87 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
 }
 void create_gui_elements(HWND hwnd) {
-    int y = 10;
+    // Main Tab Control
+    g_hTabControl = CreateWindow(WC_TABCONTROL, L"", WS_CHILD | WS_VISIBLE, 5, 5, 470, 470, hwnd, NULL, NULL, NULL);
+    TCITEM tie;
+    tie.mask = TCIF_TEXT;
+    tie.pszText = (LPWSTR)L"Settings";
+    TabCtrl_InsertItem(g_hTabControl, 0, &tie);
+    tie.pszText = (LPWSTR)L"Instructions";
+    TabCtrl_InsertItem(g_hTabControl, 1, &tie);
+
+    int y = 40; // Y-position for controls inside the tab
     const int ITEM_HEIGHT = 20; const int LABEL_WIDTH = 145; const int EDIT_WIDTH = 100;
     const int ROW_GAP = 28; const int GROUP_GAP = 35;
 
-    CreateWindow(L"STATIC", L"Process Name:", WS_VISIBLE | WS_CHILD, 10, y, LABEL_WIDTH, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hProcessNameEdit = CreateWindow(L"EDIT", L"RobloxPlayerBeta.exe", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, y, 295, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
+    // --- Settings Tab Controls ---
+    g_settingsControls.push_back(CreateWindow(L"STATIC", L"Process Name:", WS_CHILD, 10, y, LABEL_WIDTH, ITEM_HEIGHT, hwnd, NULL, NULL, NULL));
+    g_hProcessNameEdit = CreateWindow(L"EDIT", L"RobloxPlayerBeta.exe", WS_CHILD | WS_BORDER, 160, y, 295, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
     y += ROW_GAP;
-    g_hProtoTCP = CreateWindow(L"BUTTON", L"TCP", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 10, y, 50, ITEM_HEIGHT, hwnd, (HMENU)301, NULL, NULL);
-    g_hProtoUDP = CreateWindow(L"BUTTON", L"UDP", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 70, y, 50, ITEM_HEIGHT, hwnd, (HMENU)302, NULL, NULL);
-    g_hProtoBoth = CreateWindow(L"BUTTON", L"Both", WS_VISIBLE | WS_CHILD | BS_AUTORADIOBUTTON, 130, y, 60, ITEM_HEIGHT, hwnd, (HMENU)303, NULL, NULL);
-    CreateWindow(L"STATIC", L"<- If you're unsure, use Both.", WS_VISIBLE | WS_CHILD, 200, y, 255, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
+    g_hProtoTCP = CreateWindow(L"BUTTON", L"TCP", WS_CHILD | BS_AUTORADIOBUTTON | WS_GROUP, 10, y, 50, ITEM_HEIGHT, hwnd, (HMENU)301, NULL, NULL);
+    g_hProtoUDP = CreateWindow(L"BUTTON", L"UDP", WS_CHILD | BS_AUTORADIOBUTTON, 70, y, 50, ITEM_HEIGHT, hwnd, (HMENU)302, NULL, NULL);
+    g_hProtoBoth = CreateWindow(L"BUTTON", L"Both", WS_CHILD | BS_AUTORADIOBUTTON, 130, y, 60, ITEM_HEIGHT, hwnd, (HMENU)303, NULL, NULL);
+    g_settingsControls.push_back(CreateWindow(L"STATIC", L"<- If you're unsure, use Both.", WS_CHILD, 200, y, 255, ITEM_HEIGHT, hwnd, NULL, NULL, NULL));
     y += GROUP_GAP;
 
-    CreateWindow(L"STATIC", L"Toggle Keybind:", WS_VISIBLE | WS_CHILD, 10, y, LABEL_WIDTH, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hToggleKeyEdit = CreateWindow(L"EDIT", L"Z", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)101, NULL, NULL);
+    g_hEnableToggleKeyCheck = CreateWindow(L"BUTTON", L"Enable Instant Toggle", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 145, ITEM_HEIGHT, hwnd, (HMENU)403, NULL, NULL);
+    y += ROW_GAP;
+    g_settingsControls.push_back(CreateWindow(L"STATIC", L"Toggle Keybind:", WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL));
+    g_hToggleKeyEdit = CreateWindow(L"EDIT", L"Z", WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)101, NULL, NULL);
     y += GROUP_GAP;
 
-    g_hEnableTimedModeCheck = CreateWindow(L"BUTTON", L"Enable Timed Mode", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 145, ITEM_HEIGHT, hwnd, (HMENU)401, NULL, NULL);
+    g_hEnableTimedModeCheck = CreateWindow(L"BUTTON", L"Enable Timed Mode", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 145, ITEM_HEIGHT, hwnd, (HMENU)401, NULL, NULL);
     y += ROW_GAP;
-    CreateWindow(L"STATIC", L"Timed Mode Hotkey:", WS_VISIBLE | WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hTimedKeyEdit = CreateWindow(L"EDIT", L"C", WS_VISIBLE | WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)102, NULL, NULL);
-    g_hTimedModeStatusLabel = CreateWindow(L"STATIC", L"Timed Mode: OFF", WS_VISIBLE | WS_CHILD, 270, y, 185, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
+    g_settingsControls.push_back(CreateWindow(L"STATIC", L"Timed Mode Hotkey:", WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL));
+    g_hTimedKeyEdit = CreateWindow(L"EDIT", L"C", WS_CHILD | WS_BORDER | ES_CENTER | ES_READONLY, 160, y, EDIT_WIDTH, ITEM_HEIGHT, hwnd, (HMENU)102, NULL, NULL);
+    g_hTimedModeStatusLabel = CreateWindow(L"STATIC", L"Timed Mode: OFF", WS_CHILD, 270, y, 185, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
     y += ROW_GAP;
-    CreateWindow(L"STATIC", L"Enter ms:", WS_VISIBLE | WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL);
-    g_hTimedModeMsEdit = CreateWindow(L"EDIT", L"200", WS_VISIBLE | WS_CHILD | WS_BORDER, 160, y, 50, ITEM_HEIGHT, hwnd, (HMENU)103, NULL, NULL);
-    y += ROW_GAP;
-    g_hTimedModeExplanationLabel = CreateWindow(L"STATIC", L"When Timed Mode is ON, and you press the hotkey, first click starts delay, then turns on the switch, second click disables.", WS_VISIBLE | WS_CHILD, 25, y, 430, 50, hwnd, NULL, NULL, NULL);
-    y += 50;
-    y += 15;
-
-    g_hInboundCheck = CreateWindow(L"BUTTON", L"Inbound (Used for COM Offset)", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 240, ITEM_HEIGHT, hwnd, (HMENU)201, NULL, NULL);
-    y += ROW_GAP;
-    g_hOutboundCheck = CreateWindow(L"BUTTON", L"Outbound", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)202, NULL, NULL);
-    y += ROW_GAP;
-    g_hBothCheck = CreateWindow(L"BUTTON", L"Both", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)203, NULL, NULL);
-    y += ROW_GAP;
-    g_hAlwaysOnTopCheck = CreateWindow(L"BUTTON", L"Always on Top", WS_VISIBLE | WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)402, NULL, NULL);
+    g_settingsControls.push_back(CreateWindow(L"STATIC", L"Enter ms:", WS_CHILD, 25, y, 130, ITEM_HEIGHT, hwnd, NULL, NULL, NULL));
+    g_hTimedModeMsEdit = CreateWindow(L"EDIT", L"200", WS_CHILD | WS_BORDER, 160, y, 50, ITEM_HEIGHT, hwnd, (HMENU)103, NULL, NULL);
     y += GROUP_GAP;
 
-    g_hStatusLabel = CreateWindow(L"STATIC", L"Status: Idle. Press Start.", WS_VISIBLE | WS_CHILD, 10, y, 445, 40, hwnd, NULL, NULL, NULL);
-    y += 50;
-    g_hStartButton = CreateWindow(L"BUTTON", L"Start", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 130, y, 100, 30, hwnd, (HMENU)1, NULL, NULL);
-    g_hStopButton = CreateWindow(L"BUTTON", L"Stop", WS_VISIBLE | WS_CHILD, 250, y, 100, 30, hwnd, (HMENU)2, NULL, NULL);
+    g_hInboundCheck = CreateWindow(L"BUTTON", L"Inbound (Used for COM Offset)", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 240, ITEM_HEIGHT, hwnd, (HMENU)201, NULL, NULL);
+    y += ROW_GAP;
+    g_hOutboundCheck = CreateWindow(L"BUTTON", L"Outbound", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)202, NULL, NULL);
+    y += ROW_GAP;
+    g_hBothCheck = CreateWindow(L"BUTTON", L"Both", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)203, NULL, NULL);
+    y += ROW_GAP;
+    g_hAlwaysOnTopCheck = CreateWindow(L"BUTTON", L"Always on Top", WS_CHILD | BS_AUTOCHECKBOX, 10, y, 120, ITEM_HEIGHT, hwnd, (HMENU)402, NULL, NULL);
+    y += GROUP_GAP + 10;
+
+    // --- Instructions Tab Controls ---
+    const wchar_t* instructions =
+        L"--- General Use ---\r\n"
+        L"1. Enter the process name (e.g., RobloxPlayerBeta.exe).\r\n"
+        L"2. Choose your settings and hotkeys.\r\n"
+        L"3. Press Start.\r\n\r\n"
+        L"--- Instant Mode ---\r\n"
+        L"1. Check \"Enable Instant Toggle\".\r\n"
+        L"2. Press your \"Toggle Keybind\" to instantly turn the lag on or off.\r\n"
+        L"   (This is useful for general purpose lagging).\r\n\r\n"
+        L"--- Timed Mode (Gearless Offset) ---\r\n"
+        L"This mode is designed for precise actions, like using it for gearless offset of COM.\r\n\r\n"
+        L"1. Configure your desired settings & Check \"Enable Timed Mode\".\r\n"
+        L"2. Press your \"Timed Mode Hotkey\" to \"ARM\" the system. The status will change to \"ON (Click to use)\".\r\n"
+        L"3. In-game, open the menu and hover your mouse over the \"Reset Character\" button.\r\n"
+        L"4. Left-click to reset. The lag will activate automatically after the millisecond delay you set.\r\n"
+        L"5. To disable the lag, simply click your mouse again.";
+    g_hInstructionsText = CreateWindow(L"EDIT", instructions, WS_CHILD | ES_MULTILINE | ES_READONLY | WS_VSCROLL, 10, 40, 455, 380, hwnd, NULL, NULL, NULL);
+
+    // --- Shared Controls (Outside Tab) ---
+    g_hStatusLabel = CreateWindow(L"STATIC", L"Status: Idle. Press Start.", WS_VISIBLE | WS_CHILD, 10, 475, 445, 40, hwnd, NULL, NULL, NULL);
+    g_hStartButton = CreateWindow(L"BUTTON", L"Start", WS_VISIBLE | WS_CHILD | BS_DEFPUSHBUTTON, 130, 505, 100, 30, hwnd, (HMENU)1, NULL, NULL);
+    g_hStopButton = CreateWindow(L"BUTTON", L"Stop", WS_VISIBLE | WS_CHILD, 250, 505, 100, 30, hwnd, (HMENU)2, NULL, NULL);
+
+    // Group all controls for easy show/hide
+    g_settingsControls.insert(g_settingsControls.end(), { g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth, g_hEnableToggleKeyCheck, g_hToggleKeyEdit, g_hEnableTimedModeCheck, g_hTimedKeyEdit, g_hTimedModeStatusLabel, g_hTimedModeMsEdit, g_hInboundCheck, g_hOutboundCheck, g_hBothCheck, g_hAlwaysOnTopCheck });
+    g_instructionsControls.push_back(g_hInstructionsText);
+    g_configControls = { g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth, g_hEnableToggleKeyCheck, g_hToggleKeyEdit, g_hEnableTimedModeCheck, g_hTimedKeyEdit, g_hTimedModeMsEdit, g_hAlwaysOnTopCheck };
 
     EnableWindow(g_hStopButton, FALSE);
-    g_configControls = { g_hProcessNameEdit, g_hProtoTCP, g_hProtoUDP, g_hProtoBoth, g_hEnableTimedModeCheck, g_hToggleKeyEdit, g_hInboundCheck, g_hOutboundCheck, g_hBothCheck, g_hAlwaysOnTopCheck };
     g_originalToggleKeyProc = (WNDPROC)SetWindowLongPtr(g_hToggleKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
     g_originalTimedKeyProc = (WNDPROC)SetWindowLongPtr(g_hTimedKeyEdit, GWLP_WNDPROC, (LONG_PTR)KeybindEditProc);
+    SwitchTab(0); // Show settings tab by default
 }
 void SaveSettings() {
     wchar_t buffer[256];
@@ -346,6 +387,7 @@ void SaveSettings() {
     wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 202) ? 1 : 0); WritePrivateProfileString(L"Settings", L"BlockOutbound", buffer, g_iniPath);
     wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 401) ? 1 : 0); WritePrivateProfileString(L"Settings", L"EnableTimedMode", buffer, g_iniPath);
     wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 402) ? 1 : 0); WritePrivateProfileString(L"Settings", L"AlwaysOnTop", buffer, g_iniPath);
+    wsprintf(buffer, L"%d", IsDlgButtonChecked(g_hwnd, 403) ? 1 : 0); WritePrivateProfileString(L"Settings", L"EnableToggleKey", buffer, g_iniPath);
 }
 void LoadSettings() {
     wchar_t buffer[256]; wchar_t keyName[50];
@@ -368,9 +410,11 @@ void LoadSettings() {
     bool alwaysOnTop = GetPrivateProfileInt(L"Settings", L"AlwaysOnTop", 1, g_iniPath) == 1;
     CheckDlgButton(g_hwnd, 402, alwaysOnTop ? BST_CHECKED : BST_UNCHECKED);
     if (alwaysOnTop) { SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE); }
+    bool enableToggle = GetPrivateProfileInt(L"Settings", L"EnableToggleKey", 1, g_iniPath) == 1;
+    CheckDlgButton(g_hwnd, 403, enableToggle ? BST_CHECKED : BST_UNCHECKED);
 }
 void update_status(const std::wstring& status, bool isSubStatus) {
-    if (isSubStatus) { SetWindowText(g_hTimedModeStatusLabel, status.c_str()); } 
+    if (isSubStatus) { SetWindowText(g_hTimedModeStatusLabel, status.c_str()); }
     else { SetWindowText(g_hStatusLabel, (L"Status: " + status).c_str()); }
 }
 void set_config_controls_state(bool enabled, bool stopping) {
@@ -384,31 +428,31 @@ void set_config_controls_state(bool enabled, bool stopping) {
 void set_timed_mode_controls_state(bool enabled) {
     EnableWindow(g_hTimedKeyEdit, enabled);
     EnableWindow(g_hTimedModeMsEdit, enabled);
-    EnableWindow(g_hTimedModeExplanationLabel, enabled);
-    EnableWindow(g_hTimedModeStatusLabel, enabled);
-    if (!enabled) { g_isTimedModeEnabled = false; update_status(L"Timed Mode: OFF", true); }
+    // Note: Explanation Label is now part of the settings controls and handled by the main function
 }
 void start_throttling() {
     wchar_t buffer[256]; GetWindowText(g_hProcessNameEdit, buffer, 256); std::wstring processName = buffer;
-    g_throttleInbound = IsDlgButtonChecked(g_hwnd, 201); g_throttleOutbound = IsDlgButtonChecked(g_hwnd, 202);
     update_status(L"Searching for process: " + processName); g_targetPid = find_pid_by_name(processName);
     if (g_targetPid == 0) { update_status(L"Process not found. Please start it and try again."); return; }
     update_status(L"Found " + processName + L" (PID: " + std::to_wstring(g_targetPid) + L"). Discovering ports...");
     const char* filter = IsDlgButtonChecked(g_hwnd, 301) ? "tcp" : (IsDlgButtonChecked(g_hwnd, 302) ? "udp" : "tcp or udp");
     g_winDivertHandle = WinDivertOpen(filter, WINDIVERT_LAYER_NETWORK, 0, 0);
     if (g_winDivertHandle == INVALID_HANDLE_VALUE) { update_status(GetLastError() == 5 ? L"Error: Must be run as Administrator." : L"Error: WinDivert failed. Code: " + std::to_wstring(GetLastError())); return; }
-    g_exitSignal = false; // Reset signal before starting threads
+    g_exitSignal = false;
     set_config_controls_state(false);
     g_workerThread = std::thread(packet_worker_thread); g_inputThread = std::thread(input_handler_thread);
     g_portDiscoveryThread = std::thread(port_discovery_loop); g_mouseHookThread = std::thread(mouse_hook_thread);
 }
-// *** FIX: This is now the dedicated background shutdown function ***
 void stop_throttling_worker() {
     g_exitSignal = true;
     if (g_mouseHook) { PostThreadMessageW(GetThreadId(g_mouseHookThread.native_handle()), WM_QUIT, 0, 0); g_mouseHook = NULL; }
     if (g_winDivertHandle) { WinDivertClose(g_winDivertHandle); g_winDivertHandle = NULL; }
     if (g_workerThread.joinable()) g_workerThread.join(); if (g_inputThread.joinable()) g_inputThread.join();
     if (g_portDiscoveryThread.joinable()) g_portDiscoveryThread.join(); if (g_mouseHookThread.joinable()) g_mouseHookThread.join();
-    // After everything is joined, send a message back to the UI thread to re-enable controls
     PostMessage(g_hwnd, WM_APP_STOP_COMPLETE, 0, 0);
+}
+// *** NEW *** Manages showing and hiding controls when switching tabs.
+void SwitchTab(int tabIndex) {
+    for (HWND hControl : g_settingsControls) { ShowWindow(hControl, tabIndex == 0 ? SW_SHOW : SW_HIDE); }
+    for (HWND hControl : g_instructionsControls) { ShowWindow(hControl, tabIndex == 1 ? SW_SHOW : SW_HIDE); }
 }
